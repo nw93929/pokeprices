@@ -62,12 +62,48 @@ def render_history_plot(
 
     fig, ax = plt.subplots(figsize=(8, 4))
     try:
-        ax.plot(times, prices, marker="o", linewidth=1.5)
+        ax.plot(times, prices, marker="o", markersize=4, linewidth=1.5)
         ax.set_title(f"{card_name} ({card_id}) — last {window_label}")
         ax.set_xlabel("Time (UTC)")
         ax.set_ylabel("TCGplayer market price ($)")
         ax.grid(True, alpha=0.3)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+
+        # Zoom y-axis tight to the actual price range so small fluctuations
+        # are visible. Without this, matplotlib chooses round-number ticks
+        # and a $5 swing on a $4,250 card looks completely flat. If the
+        # range is essentially zero, force a small visible band so the line
+        # doesn't sit on top of an axis tick.
+        pmin, pmax = min(prices), max(prices)
+        prange = pmax - pmin
+        if prange < 0.005 * pmax:
+            prange = max(0.02 * pmax, 0.10)
+        pad = prange * 0.20
+        ax.set_ylim(pmin - pad, pmax + pad)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"${v:,.2f}"))
+
+        # Annotate min and max so the actual magnitude is unambiguous.
+        imin = prices.index(pmin)
+        imax = prices.index(pmax)
+        ax.annotate(
+            f"min ${pmin:,.2f}",
+            xy=(times[imin], pmin),
+            xytext=(5, -12), textcoords="offset points",
+            fontsize=8, color="#666",
+        )
+        if imax != imin:
+            ax.annotate(
+                f"max ${pmax:,.2f}",
+                xy=(times[imax], pmax),
+                xytext=(5, 5), textcoords="offset points",
+                fontsize=8, color="#666",
+            )
+
+        # ConciseDateFormatter picks an appropriate granularity for the
+        # window: hours for a single day, dates for a week+, months for a
+        # year. Way better than a fixed YYYY-MM-DD format.
+        locator = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         fig.autofmt_xdate()
 
         buf = io.BytesIO()

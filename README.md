@@ -9,10 +9,8 @@ exposes them through a Chalice / API Gateway service.
 ## Data source
 
 Prices come from the [Pokémon TCG API](https://pokemontcg.io), which
-republishes TCGplayer market prices on every card payload under
-`card.tcgplayer.prices.<variant>.market`. Card prices swing meaningfully
-on tournament results, reprints, and YouTube coverage, so a *series* of
-samples reveals trends that a single snapshot cannot.
+republishes TCGplayer market prices on every card under
+`card.tcgplayer.prices.<variant>.market`. A good amount of people have tried investing in cards as a viable passive income strategy and this bot helps collectors and investors keep track of both long term movement and short term. Card prices can swing based on key events like tournament results, and reprint announcements, and so on, which cannot be captured with a single lookup price but can be with a time series plot over time.
 
 ## Sampling cadence and storage
 
