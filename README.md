@@ -31,6 +31,8 @@ republishes TCGplayer market prices on every card under
 The zone apex (`GET /`) returns `{about, resources}`. Every other resource
 returns `{ "response": ... }`.
 
+NOTE: You can find any card's ID by searching at https://pokemontcg.io.
+
 | Resource | Args | Returns |
 |---|---|---|
 | `price` | `card` (id or name) | Latest TCGplayer market price for one card. Lazy-adds the card to the watchlist. |

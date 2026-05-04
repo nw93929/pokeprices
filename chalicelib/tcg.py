@@ -7,6 +7,7 @@ on a 6-hour cadence.
 """
 
 import os
+import re
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -262,6 +263,18 @@ def resolve_card(identifier: str) -> dict:
             log.info("ID lookup miss for %r; falling back to name search", identifier)
 
     candidates = search_card(identifier)
+    if not candidates:
+        # User input often has decoration the bot can't strip - parens
+        # (`magikarp(paldean fates 203)`), brackets, or trailing set names.
+        # Retry with everything after the first such marker chopped off.
+        simplified = re.split(r"[(\[]", identifier, maxsplit=1)[0].strip()
+        if simplified and simplified.lower() != identifier.lower():
+            log.info(
+                "Strict search empty for %r; retrying with simplified=%r",
+                identifier, simplified,
+            )
+            candidates = search_card(simplified)
+
     if not candidates:
         log.info("No name-search candidates for %r", identifier)
         raise CardNotFoundError(identifier)
