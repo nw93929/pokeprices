@@ -165,6 +165,43 @@ def _query_variant_candidates(variant: str, threshold: float) -> list[dict]:
         return []
 
 
+def fetch_all_priced_cards(threshold: float = 5.0) -> list[dict]:
+    """Bulk-fetch every card above `threshold`, with prices already extracted.
+
+    Used by the scheduled ingest to track every meaningfully-priced card
+    in the catalog without anyone having to call /price first. Runs the
+    7 variant queries in parallel and dedupes by card id; pokemontcg.io's
+    250-per-page cap × 7 variants gives us roughly 1k-1.5k unique cards
+    per call after dedup, which comfortably covers everything above $5.
+
+    Returns: [{"card": payload, "price": float, "variant": str}, ...]
+    (no sorting; the caller writes them all to the store).
+    """
+    seen: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=len(PRICE_VARIANT_PREFERENCE)) as pool:
+        futures = {
+            pool.submit(_query_variant_candidates, v, threshold): v
+            for v in PRICE_VARIANT_PREFERENCE
+        }
+        for future in as_completed(futures):
+            for card in future.result():
+                cid = card.get("id")
+                if cid and cid not in seen:
+                    seen[cid] = card
+
+    out: list[dict] = []
+    for card in seen.values():
+        price, variant = extract_market_price(card)
+        if price is not None:
+            out.append({"card": card, "price": price, "variant": variant})
+
+    log.info(
+        "fetch_all_priced_cards: %d unique cards above $%s",
+        len(out), threshold,
+    )
+    return out
+
+
 def top_cards_by_price(
     n: int = 10,
     threshold: float = 100.0,

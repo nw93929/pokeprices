@@ -30,8 +30,9 @@ card into DynamoDB. The watchlist is populated lazily by /price calls and
 also gets seeded each time /top is called.
 """
 
+import os
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from chalice import BadRequestError, Chalice, NotFoundError, Rate
 
@@ -69,16 +70,46 @@ def _extract_card(qs: dict) -> str | None:
     return None
 
 
-def _extract_window(qs: dict, default: str = "30d") -> str:
-    """Pull the window from query params, defaulting if absent."""
+def _extract_window(qs: dict) -> str | None:
+    """Pull the window from query params. Returns None when unspecified
+    (signals 'auto-fit to all available data')."""
     if not qs:
-        return default
+        return None
     if qs.get("window"):
         return qs["window"]
     for k, v in qs.items():
         if not v and _looks_like_window(k):
             return k
-    return default
+    return None
+
+
+def _humanize_span(seconds: float) -> str:
+    """Compact label for a duration: '23h', '5d', '2mo', '1y'."""
+    if seconds < 86400 * 1.5:
+        return f"{max(1, int(round(seconds / 3600)))}h"
+    if seconds < 86400 * 60:
+        return f"{int(round(seconds / 86400))}d"
+    if seconds < 86400 * 730:
+        return f"{int(round(seconds / (86400 * 30)))}mo"
+    return f"{int(round(seconds / (86400 * 365)))}y"
+
+
+def _auto_window(history: list[dict]) -> tuple[timedelta, str, float]:
+    """Derive a (timedelta, label, months) covering all available data.
+
+    Used when the caller didn't specify a window. With a single sample we
+    fall back to a 24h frame so the chart axis is still meaningful.
+    """
+    if len(history) >= 2:
+        first_ts = int(history[0]["timestamp"])
+        last_ts = int(history[-1]["timestamp"])
+        span_s = max(last_ts - first_ts, 3600)
+        # 5% padding so the first/last marker isn't on the axis edge
+        span_s *= 1.05
+    else:
+        span_s = 86400.0
+    months = span_s / (86400 * 30)
+    return timedelta(seconds=span_s), _humanize_span(span_s), months
 
 
 def _resolve_or_404(card_q: str) -> dict:
@@ -98,6 +129,34 @@ def _resolve_or_404(card_q: str) -> dict:
 def _decode(s: str) -> str:
     """URL-decode a path segment (Chalice gives us the raw value)."""
     return urllib.parse.unquote(s) if s else s
+
+
+def _ensure_tracked(card: dict) -> tuple[float | None, str | None]:
+    """Persist a fresh snapshot + ensure the card is on the watchlist.
+
+    Called by /price, /plot, and /change so that any card the user asks
+    about starts collecting history immediately. All store errors are
+    logged and swallowed — a transient DynamoDB failure shouldn't break
+    the user-facing reply.
+    """
+    market, variant = tcg.extract_market_price(card)
+    if market is None:
+        log.info("No market price available for card_id=%s", card.get("id"))
+        return None, None
+
+    try:
+        store.put_price(
+            card["id"], market, variant=variant, name=card.get("name", "")
+        )
+    except Exception:
+        log.exception("Failed to persist snapshot for %s", card.get("id"))
+
+    try:
+        store.add_to_watchlist(card["id"], name=card.get("name", ""))
+    except Exception:
+        log.exception("Failed to add %s to watchlist", card.get("id"))
+
+    return market, variant
 
 
 # ---------------------------------------------------------------------------
@@ -132,31 +191,14 @@ def _price_impl(card_q: str | None) -> dict:
 
     log.info("/price card=%r", card_q)
     card = _resolve_or_404(card_q)
-
-    market, variant = tcg.extract_market_price(card)
+    market, variant = _ensure_tracked(card)
     if market is None:
-        log.info("No market price available for card_id=%s", card.get("id"))
         return {
             "response": (
                 f"{card.get('name')} ({card.get('id')}) - "
                 f"no TCGplayer market price available"
             )
         }
-
-    # Persist a snapshot + lazy-add to the watchlist. Errors are logged but
-    # don't break the user-facing reply (the schedule will catch up).
-    try:
-        store.put_price(
-            card["id"], market, variant=variant, name=card.get("name", "")
-        )
-    except Exception:
-        log.exception("Failed to persist snapshot for %s", card.get("id"))
-
-    try:
-        store.add_to_watchlist(card["id"], name=card.get("name", ""))
-    except Exception:
-        log.exception("Failed to add %s to watchlist", card.get("id"))
-
     return {
         "response": (
             f"{card.get('name')} ({card.get('id')}) - "
@@ -225,25 +267,34 @@ def top():
 # /plot — price-history chart in S3
 # ---------------------------------------------------------------------------
 
-def _plot_impl(card_q: str | None, window: str) -> dict:
+def _plot_impl(card_q: str | None, window: str | None) -> dict:
     if not card_q:
         return {
             "response": (
-                "usage: try `/project pokeprices plot/<card-name>/<window>` "
-                "(window like 7d, 30d, 1m, 1y; defaults to 30d)"
+                "usage: try `/project pokeprices plot/<card-name>` "
+                "(or plot/<card>/<window> for 7d, 30d, 1m, 1y - "
+                "defaults to all available data)"
             )
         }
 
     log.info("/plot card=%r window=%r", card_q, window)
-    try:
-        delta, _ = analytics.parse_window(window)
-    except analytics.WindowParseError as exc:
-        return {"response": str(exc)}
+
+    # Resolve window if user gave one; otherwise we'll auto-fit after
+    # loading history.
+    if window is not None:
+        try:
+            delta, _ = analytics.parse_window(window)
+        except analytics.WindowParseError as exc:
+            return {"response": str(exc)}
+        since = int((datetime.now(timezone.utc) - delta).timestamp())
+    else:
+        delta = None
+        since = None
 
     card = _resolve_or_404(card_q)
     card_id = card["id"]
+    _ensure_tracked(card)
 
-    since = int((datetime.now(timezone.utc) - delta).timestamp())
     try:
         history = store.get_history(card_id, since_ts=since)
     except Exception:
@@ -253,14 +304,20 @@ def _plot_impl(card_q: str | None, window: str) -> dict:
     if not history:
         return {
             "response": (
-                f"no price history yet for {card.get('name')} ({card_id}) - "
-                f"call price for it first to start tracking"
+                f"no TCGplayer market price available for "
+                f"{card.get('name')} ({card_id})"
             )
         }
 
+    if delta is None:
+        delta, window_label, _ = _auto_window(history)
+    else:
+        window_label = window
+
     try:
         url = plotting.render_history_plot(
-            card_id, card.get("name", card_id), history, window
+            card_id, card.get("name", card_id), history, window_label,
+            window_delta=delta,
         )
     except plotting.PlotError as exc:
         log.error("/plot: render failed: %s", exc)
@@ -277,7 +334,7 @@ def plot():
 
 @app.route("/plot/{card}")
 def plot_by_card(card):
-    return _plot_impl(_decode(card), "30d")
+    return _plot_impl(_decode(card), None)
 
 
 @app.route("/plot/{card}/{window}")
@@ -289,44 +346,57 @@ def plot_by_card_window(card, window):
 # /change — total % over window + avg $/month
 # ---------------------------------------------------------------------------
 
-def _change_impl(card_q: str | None, window: str) -> dict:
+def _change_impl(card_q: str | None, window: str | None) -> dict:
     if not card_q:
         return {
             "response": (
-                "usage: try `/project pokeprices change/<card-name>/<window>` "
-                "(window like 7d, 30d, 1m, 1y; defaults to 30d)"
+                "usage: try `/project pokeprices change/<card-name>` "
+                "(or change/<card>/<window> for 7d, 30d, 1m, 1y - "
+                "defaults to all available data)"
             )
         }
 
     log.info("/change card=%r window=%r", card_q, window)
-    try:
-        delta, months = analytics.parse_window(window)
-    except analytics.WindowParseError as exc:
-        return {"response": str(exc)}
+
+    if window is not None:
+        try:
+            delta, months = analytics.parse_window(window)
+        except analytics.WindowParseError as exc:
+            return {"response": str(exc)}
+        since = int((datetime.now(timezone.utc) - delta).timestamp())
+    else:
+        delta = None
+        months = None
+        since = None
 
     card = _resolve_or_404(card_q)
     card_id = card["id"]
+    _ensure_tracked(card)
 
-    since = int((datetime.now(timezone.utc) - delta).timestamp())
     try:
         history = store.get_history(card_id, since_ts=since)
     except Exception:
         log.exception("/change: history query failed for %s", card_id)
         return {"response": "internal error retrieving history"}
 
+    if months is None:
+        _, window_label, months = _auto_window(history)
+    else:
+        window_label = window
+
     stats = analytics.compute_change(history, months)
     if not stats:
         return {
             "response": (
                 f"not enough price history for {card.get('name')} "
-                f"({card_id}) over the last {window} - need at least 2 "
-                "snapshots; call price first or wait for the next ingest"
+                f"({card_id}) over the last {window_label} yet - need at "
+                "least 2 snapshots; check back after the next hourly ingest"
             )
         }
 
     return {
         "response": (
-            f"{card.get('name')} ({card_id}) over last {window}: "
+            f"{card.get('name')} ({card_id}) over last {window_label}: "
             f"${stats['start_price']:.2f} -> ${stats['end_price']:.2f} "
             f"({stats['pct_change_window']:+.1f}% total over window, "
             f"${stats['dollar_per_month']:+.2f}/month avg, "
@@ -343,7 +413,7 @@ def change():
 
 @app.route("/change/{card}")
 def change_by_card(card):
-    return _change_impl(_decode(card), "30d")
+    return _change_impl(_decode(card), None)
 
 
 @app.route("/change/{card}/{window}")
@@ -355,61 +425,107 @@ def change_by_card_window(card, window):
 # Scheduled ingest — fires every hour, writes a snapshot per watched card
 # ---------------------------------------------------------------------------
 
+INGEST_THRESHOLD = float(os.environ.get("INGEST_THRESHOLD", "5.0"))
+
+
 @app.schedule(Rate(1, unit=Rate.HOURS))
 def ingest(event):
+    """Hourly bulk ingest.
+
+    Phase 1 (bulk): pull every card above $INGEST_THRESHOLD from pokemontcg.io
+    in a few parallel queries and snapshot them all. This is what makes the
+    system work for any card the user asks about without any prior /price
+    call — everything above the threshold gets tracked from deploy onwards.
+
+    Phase 2 (stragglers): for any card on the watchlist that *wasn't* in the
+    bulk pull (cheap cards a user added via /price etc.), do a per-card
+    fetch so they don't fall out of history.
+    """
     log.info("Scheduled ingest starting (event_id=%s)", getattr(event, "event_id", "?"))
+
+    bulk_count, bulk_errors = 0, 0
+    bulk_ids: set[str] = set()
+    try:
+        bulk = tcg.fetch_all_priced_cards(threshold=INGEST_THRESHOLD)
+    except Exception:
+        log.exception("Bulk fetch failed; falling back to watchlist-only this cycle")
+        bulk = []
+
+    for entry in bulk:
+        card = entry["card"]
+        cid = card["id"]
+        try:
+            store.put_price(
+                cid, entry["price"], variant=entry["variant"],
+                name=card.get("name", ""),
+            )
+            store.add_to_watchlist(cid, name=card.get("name", ""))
+            bulk_ids.add(cid)
+            bulk_count += 1
+        except Exception:
+            log.exception("Failed to persist bulk card %s", cid)
+            bulk_errors += 1
+
+    # Phase 2: catch stragglers — watched cards not covered by the bulk pull.
     try:
         watched = store.list_watchlist()
     except Exception:
-        log.exception("Failed to load watchlist; aborting this cycle")
-        return {"ok": False, "reason": "watchlist load failed"}
+        log.exception("Failed to load watchlist; skipping stragglers this cycle")
+        return {
+            "ok": True, "bulk": bulk_count, "bulk_errors": bulk_errors,
+            "stragglers": 0, "straggler_errors": 0,
+        }
 
-    if not watched:
-        log.info("Watchlist is empty; nothing to ingest")
-        return {"ok": True, "snapshots": 0}
+    stragglers = [w for w in watched if w["card_id"] not in bulk_ids]
+    log.info(
+        "Bulk ingested %d cards; %d stragglers to fetch individually",
+        bulk_count, len(stragglers),
+    )
 
-    success, missing, no_price, errors = 0, 0, 0, 0
-    for entry in watched:
-        card_id = entry["card_id"]
+    extra_count, extra_errors, no_price, missing = 0, 0, 0, 0
+    for entry in stragglers:
+        cid = entry["card_id"]
         try:
-            card = tcg.get_card(card_id)
+            card = tcg.get_card(cid)
         except tcg.CardNotFoundError:
-            log.warning("Watched card %s no longer in upstream", card_id)
+            log.warning("Watched card %s no longer in upstream", cid)
             missing += 1
             continue
         except tcg.TCGFetchError:
-            log.exception("Upstream fetch failed for %s; will retry next cycle", card_id)
-            errors += 1
+            log.exception("Upstream fetch failed for %s; retry next cycle", cid)
+            extra_errors += 1
             continue
         except Exception:
-            log.exception("Unexpected error fetching %s", card_id)
-            errors += 1
+            log.exception("Unexpected error fetching %s", cid)
+            extra_errors += 1
             continue
 
-        market, variant = tcg.extract_market_price(card or {})
-        if market is None:
-            log.info("No market price for %s; skipping snapshot", card_id)
+        price, variant = tcg.extract_market_price(card or {})
+        if price is None:
             no_price += 1
             continue
 
         try:
             store.put_price(
-                card_id, market, variant=variant, name=card.get("name", "")
+                cid, price, variant=variant, name=card.get("name", "")
             )
-            success += 1
+            extra_count += 1
         except Exception:
-            log.exception("Failed to write snapshot for %s", card_id)
-            errors += 1
+            log.exception("Failed to write snapshot for straggler %s", cid)
+            extra_errors += 1
 
     log.info(
-        "Ingest done: %d snapshots, %d no-price, %d missing, %d errors (of %d)",
-        success, no_price, missing, errors, len(watched),
+        "Ingest done: %d bulk + %d stragglers (%d bulk-err, %d straggler-err, "
+        "%d no-price, %d missing)",
+        bulk_count, extra_count, bulk_errors, extra_errors, no_price, missing,
     )
     return {
         "ok": True,
-        "snapshots": success,
+        "bulk": bulk_count,
+        "stragglers": extra_count,
+        "bulk_errors": bulk_errors,
+        "straggler_errors": extra_errors,
         "no_price": no_price,
         "missing": missing,
-        "errors": errors,
-        "watched": len(watched),
+        "watchlist_size": len(watched),
     }

@@ -7,7 +7,7 @@ the object ACL to public-read). The `/plot` resource returns the public URL.
 import io
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import matplotlib
@@ -38,6 +38,7 @@ def render_history_plot(
     card_name: str,
     history: list[dict],
     window_label: str,
+    window_delta: timedelta | None = None,
 ) -> str:
     """Render a price-history plot, upload to S3, and return the public URL."""
     if not history:
@@ -97,6 +98,14 @@ def render_history_plot(
                 xytext=(5, 5), textcoords="offset points",
                 fontsize=8, color="#666",
             )
+
+        # Pin the x-axis to the requested window so a 1-point plot doesn't
+        # auto-scale to a multi-year default. End at "now", start at
+        # now - window. If we don't know the window for some reason, fall
+        # back to the data range.
+        if window_delta is not None:
+            now = datetime.now(timezone.utc)
+            ax.set_xlim(now - window_delta, now)
 
         # ConciseDateFormatter picks an appropriate granularity for the
         # window: hours for a single day, dates for a week+, months for a
